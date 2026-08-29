@@ -1,0 +1,5 @@
+[agent]
+name = "HelperBot"
+model = "auto"
+temperature = 0.2
+max_tokens = 1500
