@@ -76,12 +76,14 @@ async def get_db():
 
 
 
-async def display_users_table():
-    async with AsyncSessionFactory() as session:
-        # Build a select query
-        query = select(User).where(User.email == "satyam77876@gmail.com")
-        result = await session.execute(query)
+# async def display_users_table():
+#     async with AsyncSessionFactory() as session:
+#         # Build a select query
+#         query = select(User).where(User.email == "satyam77876@gmail.com")
+#         result = await session.execute(query)
 
-    print(type(str(result.scalar_one().id)))
+#     print(type(str(result.scalar_one().id)))
 
-asyncio.run(display_users_table())
+# asyncio.run(display_users_table())
+
+

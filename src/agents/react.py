@@ -1,35 +1,29 @@
-
 import os
 import tomllib
 from dotenv import load_dotenv
 
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage # The foundational class for all message types in LangGraph
-from langchain_core.messages import ToolMessage # Passes data back to LLM after it calls a tool such as the content and the tool_call_id
-from typing import Annotated, Sequence, TypedDict
-from langchain_core.messages import SystemMessage # Message for providing instructions to the LLM
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from typing import Annotated, Sequence, TypedDict, List, Dict, AsyncGenerator, Any
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command
 
-from src.tools.gmail_tools import read_mail, send_mail  
+from src.tools.gmail_tools import read_mail, send_mail
 from src.tools.search_tool import web_search, fetch_page
 from src.tools.function_call import tool_executor
-
 from src.guardrails.llm_grardrail import query_handle, safety_router
+
+load_dotenv()
 
 with open("prompts/system_prompt.md", "r") as file:
     SYSTEM_PROMPT = file.read()
 
-load_dotenv()
-
-tools = [web_search, fetch_page, read_mail, send_mail]
-
 with open("config.toml", "rb") as file:
     config = tomllib.load(file)  
+
+tools = [web_search, fetch_page, read_mail, send_mail]
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -41,11 +35,12 @@ llm = ChatOpenAI(
 ).bind_tools(tools)
 
 
-def model_call(state: AgentState) -> AgentState:
-    response = llm.invoke([SystemMessage(content=SYSTEM_PROMPT)] + state["messages"])
+async def model_call(state: AgentState) -> AgentState:
+    response = await llm.ainvoke([SystemMessage(content=SYSTEM_PROMPT)] + state["messages"])
     return {"messages": [response]}
 
 
+# Build Graph
 graph = StateGraph(AgentState)
 graph.add_node("guardrail_scanner", query_handle)
 graph.add_node("our_agent", model_call)
@@ -69,30 +64,50 @@ graph.add_conditional_edges(
 graph.add_edge("tools", "our_agent")
 
 checkpointer = InMemorySaver()
-app = graph.compile(checkpointer=checkpointer)
-thread = {"configurable": {"thread_id": "user-123"}}
-
-current_chat_state = {"messages": []}
-while True:
-    user_input = input("Enter: ")
-    print("\nuser: " + user_input)
-
-    if user_input.lower() == "exit":
-        print("Goodbye!")
-        break
-
-    current_chat_state["messages"].append(("user", user_input))
-    current_chat_state = app.invoke(current_chat_state, thread)
-
-    state = app.get_state(thread)
-    if state.next:
-        interrupt_data = state.tasks[0].interrupts[0].value
-        print("--- APPROVAL NEEDED ---")
-        print(interrupt_data["preview"])
-        answer = input("Proceed? [y/n]: ").strip().lower()
-        resume_payload = {"approved": answer == "y"}
-        current_chat_state = app.invoke(Command(resume=resume_payload), thread)
-
-    print("AI: " + current_chat_state["messages"][-1].content)
+agent_app = graph.compile(checkpointer=checkpointer)
 
 
+def _format_history(short_term_memory: List[Dict[str, str]]) -> List[BaseMessage]:
+    """Converts Redis short-term dictionary history into standard LangChain message objects."""
+    formatted_messages = []
+    for msg in short_term_memory:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            formatted_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            formatted_messages.append(AIMessage(content=content))
+    return formatted_messages
+
+
+async def call_agent(
+    message: str, 
+    short_term_memory: List[Dict[str, str]] = None,
+    session_id: str = "default_session"
+) -> AsyncGenerator[str, None]:
+    if short_term_memory is None:
+        short_term_memory = []
+
+    history_messages = _format_history(short_term_memory)
+    history_messages.append(HumanMessage(content=message))
+    
+    input_state = {"messages": history_messages}
+    config = {"configurable": {"thread_id": session_id}}
+
+    async for event in agent_app.astream_events(input_state, config=config, version="v2"):
+        kind = event["event"]
+        
+        # 1. Safely extract node name from event root OR metadata
+        node_name = event.get("langgraph_node") or event.get("metadata", {}).get("langgraph_node", "")
+
+        # 2. STRICT CHECK: Must be an LLM stream event AND strictly from "our_agent"
+        if kind == "on_chat_model_stream" and node_name == "our_agent":
+            chunk = event["data"]["chunk"]
+
+            # 3. Ignore tool call argument chunks
+            if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                continue
+
+            token = getattr(chunk, "content", "")
+            if token and isinstance(token, str):
+                yield token
